@@ -1,5 +1,10 @@
 {
-  "catalog": {},
+  "catalog": {
+    "last_run": "2026-11-25T22:13:12.053Z",
+    "total_items": 67104,
+    "total_pages": 5792,
+    "pages_indexed": 2800
+  },
   "enrichment": {
     "total_enriched": 4,
     "last_index": 0,

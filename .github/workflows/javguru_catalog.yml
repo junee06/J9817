@@ -1,0 +1,97 @@
+name: JAVGuru Catalog Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_workers:
+        description: 'Number of parallel enrichment workers to launch after catalog completes (default 3)'
+        required: false
+        default: '3'
+      direction:
+        description: 'Enrichment direction for launched workers: "desc" (newest first) or "asc" (oldest first)'
+        required: false
+        default: 'desc'
+      auto_start_enrichment:
+        description: 'Automatically launch parallel enrichment workers once catalog is complete (true/false)'
+        required: false
+        default: 'true'
+
+jobs:
+  build_catalog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run Catalog Indexer
+        run: |
+          echo "🚀 Running JAV.guru Full Catalog Indexer..."
+          node src/indexer.js --all
+
+      - name: Commit and Push Catalog Data
+        if: always()
+        run: |
+          echo "📊 Current dataset status:"
+          node src/status.js || true
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/catalog/ data/checkpoint.json
+          git commit -m "Catalog: sync full JAV.guru catalog index [skip ci]" || echo "No catalog changes to commit"
+
+          for i in $(seq 1 8); do
+            git pull --rebase origin main || true
+            if git push origin HEAD:main; then
+              echo "✅ Catalog pushed to main"
+              break
+            fi
+            SLEEP_S=$(( (RANDOM % 5) + 3 ))
+            echo "⚠️ Push conflict, retrying in ${SLEEP_S}s (attempt $i/8)..."
+            sleep $SLEEP_S
+          done
+
+      - name: Launch Parallel Enrichment Workers
+        if: success() && (github.event.inputs.auto_start_enrichment != 'false')
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          TOTAL_WORKERS: ${{ github.event.inputs.total_workers || '3' }}
+          DIRECTION: ${{ github.event.inputs.direction || 'desc' }}
+        run: |
+          echo "=========================================================="
+          echo "🚀 Catalog complete! Launching $TOTAL_WORKERS synced enrichment workers..."
+          echo "=========================================================="
+
+          for WORKER_ID in $(seq 1 "$TOTAL_WORKERS"); do
+            echo "-> Dispatching Enrichment Worker $WORKER_ID / $TOTAL_WORKERS..."
+            gh workflow run javguru_enrich.yml \
+              --ref "${{ github.ref_name || 'main' }}" \
+              -f worker_id="$WORKER_ID" \
+              -f total_workers="$TOTAL_WORKERS" \
+              -f limit="0" \
+              -f direction="$DIRECTION" \
+              -f max_minutes="270" \
+              -f max_part_mb="85" \
+              -f auto_continue="true" || {
+                echo "⚠️ 'gh workflow run' failed. Falling back to GitHub REST API dispatch..."
+                curl -s -X POST \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${{ github.repository }}/actions/workflows/javguru_enrich.yml/dispatches" \
+                  -d "{\"ref\":\"${{ github.ref_name || 'main' }}\",\"inputs\":{\"worker_id\":\"$WORKER_ID\",\"total_workers\":\"$TOTAL_WORKERS\",\"limit\":\"0\",\"direction\":\"$DIRECTION\",\"max_minutes\":\"270\",\"max_part_mb\":\"85\",\"auto_continue\":\"true\"}}"
+              }
+            sleep 5
+          done
+          echo "✅ All $TOTAL_WORKERS enrichment workers dispatched!"

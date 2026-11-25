@@ -1,0 +1,17 @@
+{
+  "name": "javguru-scraper",
+  "version": "1.0.0",
+  "description": "Standalone JAV.guru Scraper & Database Builder with Auto-Sharding under 85MB",
+  "type": "module",
+  "main": "src/indexer.js",
+  "scripts": {
+    "index:test": "node src/indexer.js --test",
+    "index:all": "node src/indexer.js --all",
+    "index": "node src/indexer.js",
+    "enrich:test": "node src/enricher.js --test",
+    "enrich": "node src/enricher.js",
+    "check": "node src/check-continue.js",
+    "status": "node src/status.js"
+  },
+  "dependencies": {}
+}

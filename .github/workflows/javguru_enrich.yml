@@ -1,0 +1,143 @@
+name: JAVGuru Data Enrichment Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_id:
+        description: 'Worker shard ID (1-indexed, e.g. 1, 2, or 3)'
+        required: false
+        default: '1'
+      total_workers:
+        description: 'Total number of parallel enrichment workers (default 3)'
+        required: false
+        default: '3'
+      limit:
+        description: 'Limit titles to scrape in this run (0 for all pending in shard)'
+        required: false
+        default: '0'
+      direction:
+        description: 'Enrichment direction: "desc" (newest first) or "asc" (oldest first)'
+        required: false
+        default: 'desc'
+      max_minutes:
+        description: 'Safety timer in minutes before graceful commit (default 270 = 4.5 hours)'
+        required: false
+        default: '270'
+      max_part_mb:
+        description: 'Max size in MB per partition file before sharding (default 85 to stay strictly under GitHub 100MB limit)'
+        required: false
+        default: '85'
+      auto_continue:
+        description: 'Auto-restart this worker after 3 min cooldown if pending titles remain in shard (true/false)'
+        required: false
+        default: 'true'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Sync Latest Data Before Scraping
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main || true
+
+      - name: Run Detail & Stream Enrichment (Worker ${{ github.event.inputs.worker_id || '1' }}/${{ github.event.inputs.total_workers || '3' }})
+        id: enricher
+        run: |
+          echo "🚀 Running JAV.guru Detail & Stream Enrichment (Worker ${{ github.event.inputs.worker_id || '1' }}/${{ github.event.inputs.total_workers || '3' }})..."
+          node src/enricher.js \
+            --worker-id ${{ github.event.inputs.worker_id || '1' }} \
+            --total-workers ${{ github.event.inputs.total_workers || '3' }} \
+            --limit ${{ github.event.inputs.limit || '0' }} \
+            --direction ${{ github.event.inputs.direction || 'desc' }} \
+            --max-minutes ${{ github.event.inputs.max_minutes || '270' }} \
+            --max-part-mb ${{ github.event.inputs.max_part_mb || '85' }}
+
+      - name: Commit and Push Worker Data Partitions
+        if: always()
+        env:
+          WORKER_ID: ${{ github.event.inputs.worker_id || '1' }}
+          TOTAL_WORKERS: ${{ github.event.inputs.total_workers || '3' }}
+          DIRECTION: ${{ github.event.inputs.direction || 'desc' }}
+        run: |
+          echo "📊 Current dataset partitions status:"
+          node src/status.js || true
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/enriched/ data/checkpoint*.json
+          git commit -m "Auto-enrich [w${WORKER_ID}/${TOTAL_WORKERS}]: sync JAV.guru streams (${DIRECTION}) [skip ci]" || echo "No changes to commit"
+
+          for i in $(seq 1 10); do
+            git pull --rebase origin main || true
+            if git push origin HEAD:main; then
+              echo "✅ Worker $WORKER_ID/$TOTAL_WORKERS successfully pushed to main"
+              break
+            fi
+            SLEEP_S=$(( (RANDOM % 6) + 3 ))
+            echo "⚠️ Push conflict, retrying in ${SLEEP_S}s (attempt $i/10)..."
+            sleep $SLEEP_S
+          done
+
+      - name: Auto-Continue Worker Shard After 3-Minute Cooldown
+        if: success() && (github.event.inputs.auto_continue != 'false')
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          WORKER_ID: ${{ github.event.inputs.worker_id || '1' }}
+          TOTAL_WORKERS: ${{ github.event.inputs.total_workers || '3' }}
+          BATCH_LIMIT: ${{ github.event.inputs.limit || '0' }}
+          DIRECTION: ${{ github.event.inputs.direction || 'desc' }}
+          MAX_MINUTES: ${{ github.event.inputs.max_minutes || '270' }}
+          MAX_PART_MB: ${{ github.event.inputs.max_part_mb || '85' }}
+        run: |
+          echo "=========================================================="
+          echo "🔍 Checking remaining pending titles for Worker $WORKER_ID/$TOTAL_WORKERS..."
+          echo "=========================================================="
+
+          git pull --rebase origin main || true
+          CHECK_RESULT=$(node src/check-continue.js --worker-id "$WORKER_ID" --total-workers "$TOTAL_WORKERS")
+          echo "Status: $CHECK_RESULT"
+
+          if echo "$CHECK_RESULT" | grep -q "CONTINUE"; then
+            PENDING_COUNT=$(echo "$CHECK_RESULT" | awk '{print $2}')
+            echo "⏳ $PENDING_COUNT titles remain pending in Worker $WORKER_ID/$TOTAL_WORKERS shard."
+            echo "Sleeping 180s (3 minutes) cooldown to avoid rate limits..."
+            sleep 180
+
+            echo "🚀 Triggering next run for Worker $WORKER_ID/$TOTAL_WORKERS..."
+            gh workflow run javguru_enrich.yml \
+              --ref "${{ github.ref_name || 'main' }}" \
+              -f worker_id="$WORKER_ID" \
+              -f total_workers="$TOTAL_WORKERS" \
+              -f limit="$BATCH_LIMIT" \
+              -f direction="$DIRECTION" \
+              -f max_minutes="$MAX_MINUTES" \
+              -f max_part_mb="$MAX_PART_MB" \
+              -f auto_continue="true" || {
+                echo "⚠️ 'gh workflow run' failed. Falling back to GitHub REST API dispatch..."
+                curl -s -X POST \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${{ github.repository }}/actions/workflows/javguru_enrich.yml/dispatches" \
+                  -d "{\"ref\":\"${{ github.ref_name || 'main' }}\",\"inputs\":{\"worker_id\":\"$WORKER_ID\",\"total_workers\":\"$TOTAL_WORKERS\",\"limit\":\"$BATCH_LIMIT\",\"direction\":\"$DIRECTION\",\"max_minutes\":\"$MAX_MINUTES\",\"max_part_mb\":\"$MAX_PART_MB\",\"auto_continue\":\"true\"}}"
+              }
+          else
+            echo "🎉 ALL titles in Worker $WORKER_ID/$TOTAL_WORKERS shard are 100% enriched!"
+          fi

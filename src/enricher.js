@@ -145,7 +145,10 @@ export function loadAllCatalogItems(isTest = false) {
     for (const f of files) {
         try {
             const arr = JSON.parse(fs.readFileSync(path.join(CATALOG_DIR, f), 'utf8'));
-            if (Array.isArray(arr)) items.push(...arr);
+            if (Array.isArray(arr)) {
+                if (files.length === 1) return arr;
+                for (const it of arr) items.push(it);
+            }
         } catch (e) {
             console.error(`[Enricher] Error loading catalog file ${f}: ${e.message}`);
         }

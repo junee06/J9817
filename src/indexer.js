@@ -6,6 +6,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import v8 from 'node:v8';
 import { fileURLToPath } from 'node:url';
 import { HttpClient } from './client.js';
 import { parseCatalogPage, parseCatalogPagination } from './parser.js';
@@ -214,6 +215,18 @@ export async function runIndexer() {
             console.log(`\n⏳ Max execution time reached (${opts.maxMinutes} mins) at page ${lastPageDone}/${targetPages}. Saving gracefully for resume...`);
             timedOut = true;
             break;
+        }
+
+        if (page % 25 === 0) {
+            const heapStats = v8.getHeapStatistics();
+            const heapRatio = heapStats.used_heap_size / heapStats.heap_size_limit;
+            if (heapRatio >= 0.80) {
+                const usedMb = Math.round(heapStats.used_heap_size / (1024 * 1024));
+                const limitMb = Math.round(heapStats.heap_size_limit / (1024 * 1024));
+                console.log(`\n⚠️ Heap memory threshold reached (${usedMb}MB / ${limitMb}MB = ${(heapRatio * 100).toFixed(1)}%). Saving & handing off to next workflow...`);
+                timedOut = true;
+                break;
+            }
         }
 
         process.stdout.write(`  [Page ${page}/${targetPages}]... `);

@@ -7,6 +7,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import v8 from 'node:v8';
 import { fileURLToPath } from 'node:url';
 import { HttpClient } from './client.js';
 import { PartitionManager } from './partition.js';
@@ -255,6 +256,17 @@ export async function runEnricher() {
         if (Date.now() - startTime >= maxExecutionMs) {
             console.log(`\n⏳ Max execution time reached (${opts.maxMinutes} mins). Gracefully pausing run.`);
             break;
+        }
+
+        if (processedCount > 0 && processedCount % 10 === 0) {
+            const heapStats = v8.getHeapStatistics();
+            const heapRatio = heapStats.used_heap_size / heapStats.heap_size_limit;
+            if (heapRatio >= 0.80) {
+                const usedMb = Math.round(heapStats.used_heap_size / (1024 * 1024));
+                const limitMb = Math.round(heapStats.heap_size_limit / (1024 * 1024));
+                console.log(`\n⚠️ Heap memory threshold reached (${usedMb}MB / ${limitMb}MB = ${(heapRatio * 100).toFixed(1)}%). Flushing & handing off to next workflow...`);
+                break;
+            }
         }
 
         const item = pendingItems[i];

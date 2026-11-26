@@ -1,10 +1,10 @@
 {
   "catalog": {
-    "last_run": "2026-11-26T09:34:27.482Z",
-    "total_items": 118932,
-    "total_pages": 5794,
-    "pages_indexed": 4977,
-    "is_complete": false
+    "last_run": "2026-11-26T11:17:14.199Z",
+    "total_items": 138138,
+    "total_pages": 5796,
+    "pages_indexed": 5796,
+    "is_complete": true
   },
   "enrichment": {
     "total_enriched": 4,

@@ -1,9 +1,9 @@
 {
   "catalog": {},
   "enrichment": {
-    "total_enriched": 13344,
+    "total_enriched": 52354,
     "last_index": 0,
     "failed_ids": [],
-    "last_run": "2026-11-26T20:27:55.873Z"
+    "last_run": "2026-11-26T22:13:00.998Z"
   }
 }

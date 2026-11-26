@@ -11,6 +11,10 @@ on:
         description: 'Enrichment direction for launched workers: "desc" (newest first) or "asc" (oldest first)'
         required: false
         default: 'desc'
+      max_minutes:
+        description: 'Safety timer in minutes before graceful commit & auto-resume (default 270 = 4.5 hours)'
+        required: false
+        default: '270'
       auto_start_enrichment:
         description: 'Automatically launch parallel enrichment workers once catalog is complete (true/false)'
         required: false
@@ -20,6 +24,8 @@ jobs:
   build_catalog:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      NODE_OPTIONS: '--max-old-space-size=6144'
     permissions:
       contents: write
       actions: write
@@ -35,10 +41,10 @@ jobs:
         with:
           node-version: 22
 
-      - name: Run Catalog Indexer
+      - name: Run Catalog Indexer (Resumable with Time Limit)
         run: |
-          echo "🚀 Running JAV.guru Full Catalog Indexer..."
-          node src/indexer.js --all
+          echo "🚀 Running JAV.guru Catalog Indexer (resume + max ${{ github.event.inputs.max_minutes || '270' }}m)..."
+          node src/indexer.js --all --resume --max-minutes ${{ github.event.inputs.max_minutes || '270' }}
 
       - name: Commit and Push Catalog Data
         if: always()
@@ -49,7 +55,7 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add data/catalog/ data/checkpoint.json
-          git commit -m "Catalog: sync full JAV.guru catalog index [skip ci]" || echo "No catalog changes to commit"
+          git commit -m "Catalog: sync JAV.guru catalog progress [skip ci]" || echo "No catalog changes to commit"
 
           for i in $(seq 1 8); do
             git pull --rebase origin main || true
@@ -62,36 +68,61 @@ jobs:
             sleep $SLEEP_S
           done
 
-      - name: Launch Parallel Enrichment Workers
-        if: success() && (github.event.inputs.auto_start_enrichment != 'false')
+      - name: Auto-Continue Catalog OR Launch Parallel Enrichment Workers
+        if: success()
         env:
           GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           TOTAL_WORKERS: ${{ github.event.inputs.total_workers || '3' }}
           DIRECTION: ${{ github.event.inputs.direction || 'desc' }}
+          MAX_MINUTES: ${{ github.event.inputs.max_minutes || '270' }}
+          AUTO_START: ${{ github.event.inputs.auto_start_enrichment || 'true' }}
         run: |
-          echo "=========================================================="
-          echo "🚀 Catalog complete! Launching $TOTAL_WORKERS synced enrichment workers..."
-          echo "=========================================================="
+          set +e
+          CHECK_OUT=$(node src/indexer.js --check)
+          CHECK_CODE=$?
+          set -e
+          echo "Catalog check: $CHECK_OUT (exit=$CHECK_CODE)"
 
-          for WORKER_ID in $(seq 1 "$TOTAL_WORKERS"); do
-            echo "-> Dispatching Enrichment Worker $WORKER_ID / $TOTAL_WORKERS..."
-            gh workflow run javguru_enrich.yml \
+          if [ "$CHECK_CODE" -eq 0 ]; then
+            echo "⏳ Catalog still has remaining pages ($CHECK_OUT). Sleeping 60s before auto-resuming..."
+            sleep 60
+            gh workflow run javguru_catalog.yml \
               --ref "${{ github.ref_name || 'main' }}" \
-              -f worker_id="$WORKER_ID" \
               -f total_workers="$TOTAL_WORKERS" \
-              -f limit="0" \
               -f direction="$DIRECTION" \
-              -f max_minutes="270" \
-              -f max_part_mb="85" \
-              -f auto_continue="true" || {
-                echo "⚠️ 'gh workflow run' failed. Falling back to GitHub REST API dispatch..."
+              -f max_minutes="$MAX_MINUTES" \
+              -f auto_start_enrichment="$AUTO_START" || {
                 curl -s -X POST \
                   -H "Authorization: Bearer $GH_TOKEN" \
                   -H "Accept: application/vnd.github+json" \
-                  "https://api.github.com/repos/${{ github.repository }}/actions/workflows/javguru_enrich.yml/dispatches" \
-                  -d "{\"ref\":\"${{ github.ref_name || 'main' }}\",\"inputs\":{\"worker_id\":\"$WORKER_ID\",\"total_workers\":\"$TOTAL_WORKERS\",\"limit\":\"0\",\"direction\":\"$DIRECTION\",\"max_minutes\":\"270\",\"max_part_mb\":\"85\",\"auto_continue\":\"true\"}}"
+                  "https://api.github.com/repos/${{ github.repository }}/actions/workflows/javguru_catalog.yml/dispatches" \
+                  -d "{\"ref\":\"${{ github.ref_name || 'main' }}\",\"inputs\":{\"total_workers\":\"$TOTAL_WORKERS\",\"direction\":\"$DIRECTION\",\"max_minutes\":\"$MAX_MINUTES\",\"auto_start_enrichment\":\"$AUTO_START\"}}"
               }
-            sleep 5
-          done
-          echo "✅ All $TOTAL_WORKERS enrichment workers dispatched!"
+          elif [ "$AUTO_START" != "false" ]; then
+            echo "=========================================================="
+            echo "🚀 Catalog 100% complete! Launching $TOTAL_WORKERS synced enrichment workers..."
+            echo "=========================================================="
+            for WORKER_ID in $(seq 1 "$TOTAL_WORKERS"); do
+              echo "-> Dispatching Enrichment Worker $WORKER_ID / $TOTAL_WORKERS..."
+              gh workflow run javguru_enrich.yml \
+                --ref "${{ github.ref_name || 'main' }}" \
+                -f worker_id="$WORKER_ID" \
+                -f total_workers="$TOTAL_WORKERS" \
+                -f limit="0" \
+                -f direction="$DIRECTION" \
+                -f max_minutes="270" \
+                -f max_part_mb="85" \
+                -f auto_continue="true" || {
+                  curl -s -X POST \
+                    -H "Authorization: Bearer $GH_TOKEN" \
+                    -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/${{ github.repository }}/actions/workflows/javguru_enrich.yml/dispatches" \
+                    -d "{\"ref\":\"${{ github.ref_name || 'main' }}\",\"inputs\":{\"worker_id\":\"$WORKER_ID\",\"total_workers\":\"$TOTAL_WORKERS\",\"limit\":\"0\",\"direction\":\"$DIRECTION\",\"max_minutes\":\"270\",\"max_part_mb\":\"85\",\"auto_continue\":\"true\"}}"
+                }
+              sleep 5
+            done
+            echo "✅ All $TOTAL_WORKERS enrichment workers dispatched!"
+          else
+            echo "🎉 Catalog 100% complete! (auto_start_enrichment=false)"
+          fi

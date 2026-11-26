@@ -166,39 +166,45 @@ export async function runEnricher() {
     });
     const checkpoint = loadCheckpoint(checkpointPath);
 
-    let catalog = loadAllCatalogItems(opts.isTest);
+    let pendingItems = [];
+    let totalCatalogCount = 0;
+    {
+        let catalog = loadAllCatalogItems(opts.isTest);
 
-    // If single target requested
-    if (opts.targetId || opts.targetUrl) {
-        const target = opts.targetUrl || opts.targetId;
-        const idMatch = String(target).match(/\/(\d+)\//) || String(target).match(/^(\d+)$/);
-        const targetId = idMatch ? parseInt(idMatch[1], 10) : null;
+        // If single target requested
+        if (opts.targetId || opts.targetUrl) {
+            const target = opts.targetUrl || opts.targetId;
+            const idMatch = String(target).match(/\/(\d+)\//) || String(target).match(/^(\d+)$/);
+            const targetId = idMatch ? parseInt(idMatch[1], 10) : null;
 
-        const found = catalog.find(c => c.id === targetId || c.url === target);
-        catalog = found ? [found] : [{
-            id: targetId || 0,
-            code: null,
-            title: String(target),
-            slug: String(target).split('/').filter(Boolean).pop(),
-            url: String(target).startsWith('http') ? target : `https://jav.guru/${target}/`
-        }];
+            const found = catalog.find(c => c.id === targetId || c.url === target);
+            catalog = found ? [found] : [{
+                id: targetId || 0,
+                code: null,
+                title: String(target),
+                slug: String(target).split('/').filter(Boolean).pop(),
+                url: String(target).startsWith('http') ? target : `https://jav.guru/${target}/`
+            }];
+        }
+
+        if (catalog.length === 0) {
+            console.log(`[Enricher] ⚠️ Catalog is empty. Please run catalog indexer first: npm run index`);
+            return;
+        }
+
+        totalCatalogCount = catalog.length;
+
+        // Direction sorting: default is desc (newest first). If asc, reverse
+        if (opts.direction === 'asc') {
+            catalog.reverse();
+        }
+
+        // Filter pending items not yet enriched (across ALL workers) AND assigned to this worker's shard
+        pendingItems = catalog.filter(it =>
+            !partitionManager.has(it.id, it.code, it.slug) &&
+            belongsToWorker(it, opts.workerId, opts.totalWorkers)
+        );
     }
-
-    if (catalog.length === 0) {
-        console.log(`[Enricher] ⚠️ Catalog is empty. Please run catalog indexer first: npm run index`);
-        return;
-    }
-
-    // Direction sorting: default is desc (newest first). If asc, reverse
-    if (opts.direction === 'asc') {
-        catalog.reverse();
-    }
-
-    // Filter pending items not yet enriched (across ALL workers) AND assigned to this worker's shard
-    const pendingItems = catalog.filter(it =>
-        !partitionManager.has(it.id, it.code, it.slug) &&
-        belongsToWorker(it, opts.workerId, opts.totalWorkers)
-    );
 
     console.log(`\n======================================================`);
     console.log(`        🚀 JAV.GURU ENRICHMENT WORKER                 `);
@@ -208,7 +214,7 @@ export async function runEnricher() {
         console.log(`- Worker Shard:     ${opts.workerId} / ${opts.totalWorkers}`);
     }
     console.log(`- Direction:        ${opts.direction.toUpperCase()}`);
-    console.log(`- Total in Catalog: ${catalog.length}`);
+    console.log(`- Total in Catalog: ${totalCatalogCount}`);
     console.log(`- Already Enriched: ${partitionManager.allIds.size} (all workers)`);
     console.log(`- Pending (Shard):  ${pendingItems.length}`);
     console.log(`- Run Limit:        ${opts.limit === Infinity ? 'ALL' : opts.limit}`);

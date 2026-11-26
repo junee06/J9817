@@ -22,8 +22,11 @@ function parseArgs() {
     const args = process.argv.slice(2);
     const options = {
         isTest: false,
+        isCheck: false,
+        resume: false,
         maxPages: Infinity,
         startPage: 1,
+        maxMinutes: 270,
         delayMs: DEFAULT_DELAY_MS
     };
 
@@ -32,6 +35,10 @@ function parseArgs() {
         if (args[i] === '--test') {
             options.isTest = true;
             if (!explicitPages) options.maxPages = 2;
+        } else if (args[i] === '--check') {
+            options.isCheck = true;
+        } else if (args[i] === '--resume') {
+            options.resume = true;
         } else if (args[i] === '--all') {
             options.maxPages = Infinity;
         } else if (args[i] === '--pages' && args[i + 1]) {
@@ -40,6 +47,10 @@ function parseArgs() {
             i++;
         } else if (args[i] === '--start' && args[i + 1]) {
             options.startPage = parseInt(args[i + 1], 10);
+            i++;
+        } else if (args[i] === '--max-minutes' && args[i + 1]) {
+            const m = parseFloat(args[i + 1]);
+            if (!isNaN(m) && m > 0) options.maxMinutes = m;
             i++;
         } else if (args[i] === '--delay' && args[i + 1]) {
             options.delayMs = parseInt(args[i + 1], 10);
@@ -91,13 +102,40 @@ function saveCatalogFile(filePath, items) {
 
 export async function runIndexer() {
     const opts = parseArgs();
+    const checkpoint = loadCheckpoint();
+
+    if (opts.isCheck) {
+        const cat = checkpoint.catalog || {};
+        if (cat.is_complete === true) {
+            console.log('COMPLETE');
+            process.exit(1);
+        }
+        const nextPage = (cat.pages_indexed || 0) + 1;
+        const totalPages = cat.total_pages || 5792;
+        if (cat.pages_indexed && cat.pages_indexed >= totalPages) {
+            console.log('COMPLETE');
+            process.exit(1);
+        }
+        console.log(`CONTINUE ${nextPage}/${totalPages}`);
+        process.exit(0);
+    }
+
+    if (opts.resume && !opts.isTest && checkpoint.catalog?.pages_indexed) {
+        if (checkpoint.catalog.is_complete) {
+            console.log(`[Indexer] ✅ Catalog already marked 100% complete (${checkpoint.catalog.total_items} titles).`);
+            return;
+        }
+        opts.startPage = Math.max(opts.startPage, checkpoint.catalog.pages_indexed + 1);
+    }
+
+    const startTime = Date.now();
+    const maxExecutionMs = opts.maxMinutes * 60 * 1000;
     const client = new HttpClient({ delayMs: opts.delayMs });
 
     if (!fs.existsSync(CATALOG_DIR)) {
         fs.mkdirSync(CATALOG_DIR, { recursive: true });
     }
 
-    const checkpoint = loadCheckpoint();
     const outputFile = opts.isTest
         ? path.join(CATALOG_DIR, 'javguru_catalog_test.json')
         : CATALOG_FILE;
@@ -119,29 +157,30 @@ export async function runIndexer() {
     console.log(`======================================================`);
     console.log(`- Mode:         ${opts.isTest ? 'TEST' : 'PRODUCTION'}`);
     console.log(`- Max Pages:    ${opts.maxPages === Infinity ? 'ALL' : opts.maxPages}`);
-    console.log(`- Start Page:   ${opts.startPage}`);
+    console.log(`- Start Page:   ${opts.startPage}${opts.resume ? ' (RESUMED)' : ''}`);
+    console.log(`- Max Minutes:  ${opts.maxMinutes} mins`);
     console.log(`- Output File:  ${path.basename(outputFile)}`);
     console.log(`- Existing:     ${existingMap.size} titles`);
     console.log(`======================================================\n`);
 
-    // Fetch page 1 to detect total pages
+    const fallbackTotal = checkpoint.catalog?.total_pages || 5792;
     const firstHtml = await client.getCatalogPage(opts.startPage);
     if (!firstHtml) {
         console.error(`[Indexer] ❌ Could not load catalog page ${opts.startPage}.`);
-        return;
+        process.exit(1);
     }
 
-    const detectedTotalPages = parseCatalogPagination(firstHtml, 5791);
+    const detectedTotalPages = parseCatalogPagination(firstHtml, fallbackTotal);
     const targetPages = (opts.maxPages === Infinity || opts.maxPages > detectedTotalPages)
         ? detectedTotalPages
         : opts.maxPages;
 
-    console.log(`-> Detected ${detectedTotalPages} total pages on JAV.guru (Crawl target: ${targetPages} pages)\n`);
+    console.log(`-> Detected ${detectedTotalPages} total pages on JAV.guru (Crawl target: pages ${opts.startPage}..${targetPages})\n`);
 
     let totalFound = 0;
     let totalNew = 0;
 
-    const flushProgress = (pagesIndexed) => {
+    const flushProgress = (pagesIndexed, isComplete = false) => {
         const allItems = Array.from(existingMap.values());
         saveCatalogFile(outputFile, allItems);
         if (!opts.isTest) {
@@ -149,7 +188,8 @@ export async function runIndexer() {
                 last_run: new Date().toISOString(),
                 total_items: allItems.length,
                 total_pages: detectedTotalPages,
-                pages_indexed: pagesIndexed
+                pages_indexed: pagesIndexed,
+                is_complete: isComplete
             };
             saveCheckpoint(checkpoint);
         }
@@ -157,18 +197,25 @@ export async function runIndexer() {
     };
 
     let lastPageDone = opts.startPage - 1;
+    let timedOut = false;
     let isTerminating = false;
     const handleExit = () => {
         if (isTerminating) return;
         isTerminating = true;
         console.log(`\n[Indexer] 💾 Saving catalog progress before exit (page ${lastPageDone})...`);
-        flushProgress(lastPageDone);
+        flushProgress(lastPageDone, false);
         process.exit(0);
     };
     process.on('SIGINT', handleExit);
     process.on('SIGTERM', handleExit);
 
     for (let page = opts.startPage; page <= targetPages; page++) {
+        if (Date.now() - startTime >= maxExecutionMs) {
+            console.log(`\n⏳ Max execution time reached (${opts.maxMinutes} mins) at page ${lastPageDone}/${targetPages}. Saving gracefully for resume...`);
+            timedOut = true;
+            break;
+        }
+
         process.stdout.write(`  [Page ${page}/${targetPages}]... `);
 
         const html = (page === opts.startPage) 
@@ -200,12 +247,13 @@ export async function runIndexer() {
         console.log(`✅ ${cards.length} cards (${pageNew} new).`);
 
         if (page % 100 === 0) {
-            flushProgress(page);
+            flushProgress(page, false);
             console.log(`  [Indexer] 💾 Checkpoint saved (${existingMap.size} titles so far)`);
         }
     }
 
-    const allItems = flushProgress(targetPages);
+    const completedAll = !timedOut && lastPageDone >= targetPages;
+    const allItems = flushProgress(lastPageDone, completedAll);
 
     console.log(`\n======================================================`);
     console.log(`🎉 Catalog Indexing Complete!`);

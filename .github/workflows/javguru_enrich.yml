@@ -36,6 +36,8 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      NODE_OPTIONS: '--max-old-space-size=6144'
     permissions:
       contents: write
       actions: write

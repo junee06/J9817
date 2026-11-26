@@ -13,6 +13,7 @@ class EnrichedPart {
         this.filePath = filePath;
         this.partNum = partNum;
         this.items = items;
+        this.itemCount = Array.isArray(items) ? items.length : 0;
         this.dirty = false;
         this.size = 0;
     }
@@ -23,13 +24,14 @@ export class PartitionManager {
         this.enrichedDir = enrichedDir;
         this.maxPartSizeBytes = maxPartSizeBytes;
         this.silent = options.silent ?? false;
+        this.lightweight = options.lightweight ?? true;
         this.workerId = options.workerId ? parseInt(options.workerId, 10) : null;
         this.parts = [];
         this.ownedParts = [];
         this.allIds = new Set();
         this.allCodes = new Set();
         this.allSlugs = new Set();
-        this.index = new Map(); // identifier -> { part, itemIndex }
+        this.index = new Map(); // identifier -> { part, itemIndex } (used when lightweight=false)
         this.activePart = null;
         this._init();
     }
@@ -65,7 +67,8 @@ export class PartitionManager {
             return a.partNum - b.partNum;
         });
 
-        for (const pf of partFiles) {
+        for (let pIdx = 0; pIdx < partFiles.length; pIdx++) {
+            const pf = partFiles[pIdx];
             const fullPath = path.join(this.enrichedDir, pf.file);
             let items = [];
             try {
@@ -78,11 +81,15 @@ export class PartitionManager {
             }
 
             const stat = fs.statSync(fullPath);
-            const part = new EnrichedPart(fullPath, pf.partNum, items);
+            const isOwned = this.workerId ? pf.fileWorkerId === this.workerId : pf.fileWorkerId === null;
+            const isLastOwned = isOwned && !partFiles.slice(pIdx + 1).some(x => (this.workerId ? x.fileWorkerId === this.workerId : x.fileWorkerId === null));
+            const keepInMemory = !this.lightweight || (isLastOwned && stat.size < this.maxPartSizeBytes);
+
+            const part = new EnrichedPart(fullPath, pf.partNum, keepInMemory ? items : null);
+            part.itemCount = items.length;
             part.size = stat.size;
             this.parts.push(part);
 
-            const isOwned = this.workerId ? pf.fileWorkerId === this.workerId : pf.fileWorkerId === null;
             if (isOwned) {
                 this.ownedParts.push(part);
             }
@@ -91,17 +98,20 @@ export class PartitionManager {
                 const it = items[i];
                 if (it && it.id != null) {
                     this.allIds.add(String(it.id));
-                    this.index.set(`id:${it.id}`, { part, itemIndex: i });
+                    if (!this.lightweight) this.index.set(`id:${it.id}`, { part, itemIndex: i });
                 }
                 if (it && it.code) {
-                    this.allCodes.add(String(it.code).toUpperCase());
-                    this.index.set(`code:${String(it.code).toUpperCase()}`, { part, itemIndex: i });
+                    const uc = String(it.code).toUpperCase();
+                    this.allCodes.add(uc);
+                    if (!this.lightweight) this.index.set(`code:${uc}`, { part, itemIndex: i });
                 }
                 if (it && it.slug) {
-                    this.allSlugs.add(String(it.slug).toLowerCase());
-                    this.index.set(`slug:${String(it.slug).toLowerCase()}`, { part, itemIndex: i });
+                    const ls = String(it.slug).toLowerCase();
+                    this.allSlugs.add(ls);
+                    if (!this.lightweight) this.index.set(`slug:${ls}`, { part, itemIndex: i });
                 }
             }
+            items = null;
         }
 
         if (this.ownedParts.length === 0) {
@@ -112,7 +122,7 @@ export class PartitionManager {
             this.activePart = p;
         } else {
             this.activePart = this.ownedParts[this.ownedParts.length - 1];
-            if (this.activePart.size >= this.maxPartSizeBytes) {
+            if (this.activePart.size >= this.maxPartSizeBytes || this.activePart.items === null) {
                 this._rotateNewPart();
             }
         }
@@ -124,6 +134,11 @@ export class PartitionManager {
     }
 
     _rotateNewPart() {
+        const prevPart = this.activePart;
+        if (this.lightweight && prevPart && !prevPart.dirty && Array.isArray(prevPart.items)) {
+            prevPart.itemCount = prevPart.items.length;
+            prevPart.items = null;
+        }
         const nextNum = this.ownedParts.length + 1;
         const nextPath = path.join(this.enrichedDir, this._makePartFilename(nextNum));
         console.log(`[PartitionManager] 📦 Active partition reached limit (${(this.activePart.size / (1024 * 1024)).toFixed(1)} MB). Creating ${path.basename(nextPath)}`);
@@ -216,14 +231,17 @@ export class PartitionManager {
         const partsSummary = [];
 
         for (const part of this.parts) {
-            totalItems += part.items.length;
+            const count = Array.isArray(part.items) ? part.items.length : (part.itemCount || 0);
+            totalItems += count;
             totalBytes += part.size;
-            for (const item of part.items) {
-                if (item.streams) totalStreams += item.streams.length;
+            if (Array.isArray(part.items)) {
+                for (const item of part.items) {
+                    if (item.streams) totalStreams += item.streams.length;
+                }
             }
             partsSummary.push({
                 file: path.basename(part.filePath),
-                items: part.items.length,
+                items: count,
                 sizeMB: (part.size / (1024 * 1024)).toFixed(2)
             });
         }

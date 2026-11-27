@@ -1,0 +1,134 @@
+name: JAVGuru Final Embed URL Resolver
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_id:
+        description: 'Worker ID ("all" to launch 3 parallel synced workers, or "1", "2", "3")'
+        required: false
+        default: 'all'
+      concurrency:
+        description: 'Concurrent items per worker (default 4)'
+        required: false
+        default: '4'
+      max_minutes:
+        description: 'Safety timer in minutes before graceful commit (default 270 = 4.5 hours)'
+        required: false
+        default: '270'
+      auto_continue:
+        description: 'Auto-restart worker after 3 min cooldown if pending streams remain (true/false)'
+        required: false
+        default: 'true'
+
+jobs:
+  launch_all:
+    if: github.event.inputs.worker_id == 'all' || github.event.inputs.worker_id == ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch Parallel Embed Resolver Workers (1-3)
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          for WID in 1 2 3; do
+            echo "-> Dispatching Embed Resolver Worker $WID/3..."
+            gh workflow run javguru_resolve_embeds.yml \
+              --ref "${{ github.ref_name || 'main' }}" \
+              -f worker_id="$WID" \
+              -f concurrency="${{ github.event.inputs.concurrency || '4' }}" \
+              -f max_minutes="${{ github.event.inputs.max_minutes || '270' }}" \
+              -f auto_continue="${{ github.event.inputs.auto_continue || 'true' }}" || {
+                curl -s -X POST \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${{ github.repository }}/actions/workflows/javguru_resolve_embeds.yml/dispatches" \
+                  -d "{\"ref\":\"${{ github.ref_name || 'main' }}\",\"inputs\":{\"worker_id\":\"$WID\",\"concurrency\":\"${{ github.event.inputs.concurrency || '4' }}\",\"max_minutes\":\"${{ github.event.inputs.max_minutes || '270' }}\",\"auto_continue\":\"${{ github.event.inputs.auto_continue || 'true' }}\"}}"
+              }
+            sleep 5
+          done
+
+  resolve_worker:
+    if: github.event.inputs.worker_id != 'all' && github.event.inputs.worker_id != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      NODE_OPTIONS: '--max-old-space-size=6144'
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Resolve Final Embed URLs (Worker ${{ github.event.inputs.worker_id }}/3)
+        run: |
+          node src/resolve-embeds.js \
+            --worker-id ${{ github.event.inputs.worker_id }} \
+            --concurrency ${{ github.event.inputs.concurrency || '4' }} \
+            --max-minutes ${{ github.event.inputs.max_minutes || '270' }}
+
+      - name: Commit and Push Resolved Embed URLs
+        if: always()
+        env:
+          WORKER_ID: ${{ github.event.inputs.worker_id }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/enriched/
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Auto-resolve [w${WORKER_ID}/3]: backfill final_embed_url [skip ci]"
+            for i in $(seq 1 10); do
+              git pull --rebase origin main || true
+              if git push origin HEAD:main; then
+                echo "✅ Worker $WORKER_ID/3 pushed to main"
+                break
+              fi
+              SLEEP_S=$(( (RANDOM % 6) + 3 ))
+              echo "⚠️ Push conflict, retrying in ${SLEEP_S}s (attempt $i/10)..."
+              sleep $SLEEP_S
+            done
+          fi
+
+      - name: Auto-Continue Worker Shard After 3-Minute Cooldown
+        if: success() && (github.event.inputs.auto_continue != 'false')
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          WORKER_ID: ${{ github.event.inputs.worker_id }}
+        run: |
+          set +e
+          CHECK_OUT=$(node src/resolve-embeds.js --check --worker-id "$WORKER_ID")
+          CHECK_CODE=$?
+          set -e
+          echo "Check: $CHECK_OUT (exit=$CHECK_CODE)"
+
+          if [ "$CHECK_CODE" -eq 0 ]; then
+            echo "Pending items remain in Worker $WORKER_ID/3. Sleeping 180s cooldown..."
+            sleep 180
+            gh workflow run javguru_resolve_embeds.yml \
+              --ref "${{ github.ref_name || 'main' }}" \
+              -f worker_id="$WORKER_ID" \
+              -f concurrency="${{ github.event.inputs.concurrency || '4' }}" \
+              -f max_minutes="${{ github.event.inputs.max_minutes || '270' }}" \
+              -f auto_continue="true" || {
+                curl -s -X POST \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${{ github.repository }}/actions/workflows/javguru_resolve_embeds.yml/dispatches" \
+                  -d "{\"ref\":\"${{ github.ref_name || 'main' }}\",\"inputs\":{\"worker_id\":\"$WORKER_ID\",\"concurrency\":\"${{ github.event.inputs.concurrency || '4' }}\",\"max_minutes\":\"${{ github.event.inputs.max_minutes || '270' }}\",\"auto_continue\":\"true\"}}"
+              }
+          else
+            echo "🎉 All final_embed_url values resolved for Worker $WORKER_ID/3!"
+          fi

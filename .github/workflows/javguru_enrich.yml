@@ -64,6 +64,7 @@ jobs:
         run: |
           echo "🚀 Running JAV.guru Detail & Stream Enrichment (Worker ${{ github.event.inputs.worker_id || '1' }}/${{ github.event.inputs.total_workers || '3' }})..."
           node src/enricher.js \
+            --resolve \
             --worker-id ${{ github.event.inputs.worker_id || '1' }} \
             --total-workers ${{ github.event.inputs.total_workers || '3' }} \
             --limit ${{ github.event.inputs.limit || '0' }} \

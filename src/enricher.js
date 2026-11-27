@@ -45,7 +45,7 @@ function parseArgs() {
         maxPartMb: 85,
         targetId: null,
         targetUrl: null,
-        resolveEmbeds: false,
+        resolveEmbeds: true,
         direction: 'desc', // 'desc' (newest first) or 'asc' (oldest first)
         workerId: null,
         totalWorkers: 1
@@ -76,6 +76,8 @@ function parseArgs() {
             i++;
         } else if (args[i] === '--resolve') {
             options.resolveEmbeds = true;
+        } else if (args[i] === '--no-resolve') {
+            options.resolveEmbeds = false;
         } else if (args[i] === '--direction' && args[i + 1]) {
             options.direction = args[i + 1].toLowerCase();
             i++;
@@ -297,16 +299,16 @@ export async function runEnricher() {
                 continue;
             }
 
-            // 3. Optional deep embed resolution (following searcho redirects)
+            // 3. Deep embed resolution (following searcho redirects concurrently per item)
             if (opts.resolveEmbeds && detail.streams && detail.streams.length > 0) {
-                for (const s of detail.streams) {
-                    if (s.searcho_url) {
+                await Promise.all(detail.streams.map(async (s) => {
+                    if (s.searcho_url && !s.final_embed_url) {
                         const finalEmbed = await client.resolveSearchoEmbed(s.searcho_url, detail.url);
                         if (finalEmbed) {
                             s.final_embed_url = finalEmbed;
                         }
                     }
-                }
+                }));
             }
 
             // 4. Save to partition

@@ -185,20 +185,47 @@ export class HttpClient {
             const reversed = token.split('').reverse().join('');
             const targetUrl = `${BASE_URL}/searcho/?${rtype}r=${reversed}`;
 
-            // 2. Fetch redirect target
+            // 2. Resolve redirect target (fast manual Location header check first)
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 12000);
-            const res = await fetch(targetUrl, {
-                headers: {
-                    ...this.headers,
-                    'Referer': searchoUrl
-                },
-                redirect: 'follow',
-                signal: controller.signal
-            });
-            clearTimeout(timeoutId);
+            try {
+                const res = await fetch(targetUrl, {
+                    headers: {
+                        ...this.headers,
+                        'Referer': searchoUrl
+                    },
+                    redirect: 'manual',
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+                const loc = res.headers.get('location');
+                if (loc) {
+                    return loc.startsWith('http') ? loc : new URL(loc, BASE_URL).toString();
+                }
+                if (res.url && res.url !== targetUrl && !res.url.includes('jav.guru/searcho')) {
+                    return res.url;
+                }
+            } catch {
+                clearTimeout(timeoutId);
+            }
 
-            return res.url || targetUrl;
+            // Fallback: follow redirects with curl -Ls -o /dev/null -w %{url_effective}
+            try {
+                const { stdout } = await execFileAsync(CURL_BIN, [
+                    '-sL', '-o', process.platform === 'win32' ? 'NUL' : '/dev/null',
+                    '-w', '%{url_effective}',
+                    '--max-time', '12',
+                    '-A', this.headers['User-Agent'],
+                    '-H', `Referer: ${searchoUrl}`,
+                    targetUrl
+                ], { windowsHide: true });
+                const eff = (stdout || '').trim();
+                if (eff && eff !== targetUrl && !eff.includes('jav.guru/searcho')) {
+                    return eff;
+                }
+            } catch {}
+
+            return null;
         } catch {
             return null;
         }
